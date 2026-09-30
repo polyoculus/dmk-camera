@@ -217,7 +217,7 @@ def cmd_linearity(a):
               f"max nonlinearity {np.abs(resid).max():.2f}% of range")
 
 
-def autoexpose(cam, target=0.7, lo=10, hi=500_000):
+def autoexpose(cam, target=0.7, lo=1, hi=500_000):
     """Binary-search exposure so the peak pixel sits at `target` of full scale."""
     for _ in range(14):
         e = np.sqrt(lo * hi)
