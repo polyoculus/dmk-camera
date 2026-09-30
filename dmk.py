@@ -294,6 +294,27 @@ def plot_beam(img, p, path):
     fig.savefig(path, dpi=110)
 
 
+def cmd_focus(a):
+    """Live sharpness readout: move the lens until the number peaks."""
+    cam = Camera(a.exposure, a.gain)
+    best = 0
+    print("move the lens slowly; Ctrl+C to stop")
+    try:
+        while True:
+            f = cam.frame().astype(np.float32)
+            # variance of the Laplacian, normalised by brightness so exposure
+            # changes don't masquerade as focus changes
+            sharp = cv2.Laplacian(f, cv2.CV_32F).var() / max(f.mean(), 1) ** 2 * 1e4
+            best = max(best, sharp)
+            bar = "#" * int(40 * sharp / best)
+            print(f"\rsharpness {sharp:8.2f}  best {best:8.2f}  {bar:<40}  "
+                  f"peak {f.max():4.0f}", end="", flush=True)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        cam.close()
+
+
 def cmd_preview(a):
     dev = find_device()
     x = xu.XU(dev)
@@ -340,6 +361,9 @@ def main():
     common(p, exposure=None)
     p.add_argument("--dark", action="store_true", help="take a dark frame first")
     p.set_defaults(n=5)
+
+    p = sub.add_parser("focus", help="live sharpness meter for focusing a lens")
+    common(p, exposure=10000)
 
     p = sub.add_parser("preview", help="live view window (gstreamer)")
     p.add_argument("-e", "--exposure", type=float, default=10000, help="us")
