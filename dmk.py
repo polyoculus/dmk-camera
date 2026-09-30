@@ -294,6 +294,41 @@ def plot_beam(img, p, path):
     fig.savefig(path, dpi=110)
 
 
+def cmd_record(a):
+    """Grab a frame every `interval` seconds for `duration` seconds."""
+    import matplotlib.pyplot as plt
+
+    cam = Camera(a.exposure, a.gain)
+    folder = OUT / f"{datetime.now():%Y%m%d-%H%M%S}-{a.name}"
+    folder.mkdir(parents=True)
+    frames, times = [], []
+    t0 = time.time()
+    try:
+        while (t := time.time() - t0) < a.duration:
+            cam.flush(2)  # skip frames that queued while we were saving
+            f = cam.frame()
+            frames.append(f)
+            times.append(t)
+            plt.imsave(folder / f"{len(frames):04d}.png", f, cmap="gray", vmin=0,
+                       vmax=FULL_SCALE)
+            print(f"\r{t:5.1f}s  frame {len(frames):4d}  {stats(f)}", end="", flush=True)
+            time.sleep(max(0, a.interval - (time.time() - t0 - t)))
+    except KeyboardInterrupt:
+        pass  # stopping early still writes the cube below
+    cam.close()
+    print()
+    from astropy.io import fits
+    hdr = fits.Header()
+    hdr["EXPTIME"] = a.exposure * 1e-6
+    hdr["GAIN_DB"] = a.gain
+    hdr["INTERVAL"] = a.interval
+    fits.HDUList([fits.PrimaryHDU(np.stack(frames).astype(np.uint16), hdr),
+                  fits.BinTableHDU.from_columns(
+                      [fits.Column("t", "D", array=np.array(times))])]
+                 ).writeto(folder / "cube.fits")
+    print(f"saved {len(frames)} frames to {folder}/ (PNGs + cube.fits)")
+
+
 def cmd_focus(a):
     """Live sharpness readout: move the lens until the number peaks."""
     cam = Camera(a.exposure, a.gain)
@@ -361,6 +396,12 @@ def main():
     common(p, exposure=None)
     p.add_argument("--dark", action="store_true", help="take a dark frame first")
     p.set_defaults(n=5)
+
+    p = sub.add_parser("record", help="grab frames continuously for a while")
+    common(p, exposure=10000)
+    p.add_argument("-t", "--duration", type=float, default=60, help="seconds")
+    p.add_argument("-i", "--interval", type=float, default=0.5, help="seconds")
+    p.add_argument("--name", default="record")
 
     p = sub.add_parser("focus", help="live sharpness meter for focusing a lens")
     common(p, exposure=10000)

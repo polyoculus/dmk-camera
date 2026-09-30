@@ -22,6 +22,7 @@ You need `v4l2-ctl` (v4l-utils) and, for `preview`, gstreamer.
     .venv/bin/python dmk.py noise -e 1000           # dark stats, cap the sensor first
     .venv/bin/python dmk.py linearity               # exposure sweep
     .venv/bin/python dmk.py beam --dark             # laser spot: auto-exposure, centroid, D4sigma
+    .venv/bin/python dmk.py record -t 60 -i 0.5     # a frame every 0.5 s for 60 s -> PNGs + cube.fits
     .venv/bin/python dmk.py focus -e 10000          # live sharpness meter, for focusing a lens
     .venv/bin/python dmk.py preview -e 5000         # live view window
 
