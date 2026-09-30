@@ -305,18 +305,18 @@ def cmd_record(a):
     t0 = time.time()
     try:
         while (t := time.time() - t0) < a.duration:
-            cam.flush(2)  # skip frames that queued while we were saving
             f = cam.frame()
             frames.append(f)
             times.append(t)
-            plt.imsave(folder / f"{len(frames):04d}.png", f, cmap="gray", vmin=0,
-                       vmax=FULL_SCALE)
             print(f"\r{t:5.1f}s  frame {len(frames):4d}  {stats(f)}", end="", flush=True)
             time.sleep(max(0, a.interval - (time.time() - t0 - t)))
     except KeyboardInterrupt:
         pass  # stopping early still writes the cube below
     cam.close()
     print()
+    # PNGs are written after capture; saving inline caps us at ~2.5 fps
+    for i, f in enumerate(frames, 1):
+        plt.imsave(folder / f"{i:04d}.png", f, cmap="gray", vmin=0, vmax=FULL_SCALE)
     from astropy.io import fits
     hdr = fits.Header()
     hdr["EXPTIME"] = a.exposure * 1e-6
