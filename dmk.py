@@ -19,6 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import fsm
 import xu
 
 PIXEL_UM = 3.45
@@ -54,7 +55,7 @@ def v4l2_get(dev, name):
 class Camera:
     """exposure in microseconds, gain in dB (0..48)."""
 
-    def __init__(self, exposure_us=1000, gain_db=0.0, fps=None):
+    def __init__(self, exposure_us=1000, gain_db=0.0, fps=None, buffers=None):
         self.dev = find_device()
         self.exposure_us = exposure_us
         self.gain_db = gain_db
@@ -66,6 +67,9 @@ class Camera:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        if buffers:
+            # fewer queued frames = fresher frames, which closed-loop control needs
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffers)
         if not self.cap.isOpened():
             sys.exit(f"could not open {self.dev}")
         self.xu = xu.XU(self.dev)
@@ -350,6 +354,111 @@ def cmd_focus(a):
         cam.close()
 
 
+FSM_CAL = OUT / "fsm-cal.json"
+
+
+def cmd_fsm(a):
+    """Steer the laser spot with the fast steering mirror (see fsm.py)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mirror = fsm.Mirror(a.port)
+    cam = Camera(a.exposure, a.gain, buffers=1)
+    OUT.mkdir(exist_ok=True)
+    stem = OUT / f"{datetime.now():%Y%m%d-%H%M%S}-fsm-{a.action}"
+    try:
+        if a.action == "move":
+            vx, vy = mirror.move(a.vx, a.vy)
+            c = fsm.measure(cam, 0.1)
+            print(f"V=({vx:.2f}, {vy:.2f})  controller reads {mirror.read()}  "
+                  f"spot {'lost' if c is None else f'({c[0]:.1f}, {c[1]:.1f})'}")
+
+        elif a.action == "calibrate":
+            cal = fsm.calibrate(cam, mirror, a.grid, a.settle)
+            fsm.save_cal(cal, FSM_CAL)
+            r = cal["reach"]
+            print(f"fit residual rms: x {cal['rms_x']:.3f} px, y {cal['rms_y']:.3f} px")
+            print(f"spot reaches x {r['x'][0]:.0f}..{r['x'][1]:.0f}, "
+                  f"y {r['y'][0]:.0f}..{r['y'][1]:.0f} px")
+            print(f"saved {FSM_CAL}")
+            vx, vy, cx, cy = np.array(cal["points"]).T
+            px, py = fsm.predict(cal, vx, vy)
+            fig, ax = plt.subplots(figsize=(7, 5.5))
+            ax.plot(cx, cy, "o", mfc="none", label="measured")
+            ax.plot(px, py, "+", label="model")
+            ax.invert_yaxis()
+            ax.set_aspect("equal")
+            ax.set_xlabel("x (px)")
+            ax.set_ylabel("y (px)")
+            ax.set_title(f"FSM calibration, rms {cal['rms_x']:.2f} / {cal['rms_y']:.2f} px")
+            ax.legend()
+            fig.savefig(f"{stem}.png", dpi=110)
+            print(f"saved {stem}.png")
+
+        elif a.action == "goto":
+            cal = fsm.load_cal(FSM_CAL)
+            x, y = target(a, cal)
+            vx, vy, cx, cy, err = fsm.goto(cam, mirror, cal, x, y, a.tol, settle=a.settle)
+            print(f"{'reached' if err < a.tol else 'did NOT reach'} ({x:.1f}, {y:.1f}): "
+                  f"spot ({cx:.2f}, {cy:.2f}), error {err:.3f} px, V=({vx:.3f}, {vy:.3f})")
+
+        elif a.action == "track":
+            cal = fsm.load_cal(FSM_CAL)
+            x, y = target(a, cal)
+            print(f"holding spot at ({x:.1f}, {y:.1f}) for {a.duration:g} s, Ctrl+C to stop")
+            log = fsm.track(cam, mirror, cal, x, y, a.duration, a.kp, a.ki, settle=a.settle)
+            if len(log) < 2:
+                sys.exit("no data")
+            t, err = log[:, 0], log[:, 5]
+            steady = err[t > min(1.0, t[-1] / 2)]  # skip the initial pull-in
+            print(f"{len(log)} loops, {(len(log) - 1) / (t[-1] - t[0]):.1f} Hz; "
+                  f"steady-state error rms {np.sqrt((steady ** 2).mean()):.3f} px, "
+                  f"max {steady.max():.3f} px")
+            np.savetxt(f"{stem}.csv", log, delimiter=",", fmt="%.6f",
+                       header="t_s,vx,vy,cx,cy,error_px", comments="")
+            fig, ax = plt.subplots(figsize=(9, 4))
+            ax.plot(t, err)
+            ax.set_xlabel("time (s)")
+            ax.set_ylabel("error (px)")
+            ax.set_ylim(0, max(2.0, np.percentile(err, 99)))
+            ax.set_title(f"PI tracking, Kp={a.kp} Ki={a.ki}")
+            ax.grid(ls=":")
+            fig.savefig(f"{stem}.png", dpi=110)
+            print(f"saved {stem}.csv / .png")
+
+        elif a.action == "settle":
+            t, pos = fsm.settle_curve(cam, mirror, a.step, a.axis)
+            start, final = np.nanmedian(pos[t < 0]), np.nanmedian(pos[-10:])
+            # settled = stays within 10% of the step (or 0.5 px) of the final position
+            off = (t >= 0) & ~(np.abs(pos - final) <= max(0.5, 0.1 * abs(final - start)))
+            t_settle = t[np.nonzero(off)[0][-1] + 1] if off.any() else 0.0
+            print(f"{a.step:g} V step on {a.axis}: moved {final - start:+.1f} px, "
+                  f"settled after ~{t_settle * 1000:.0f} ms "
+                  f"(resolution = one frame, {np.diff(t).mean() * 1000:.1f} ms)")
+            fig, ax = plt.subplots(figsize=(9, 4))
+            ax.plot(t * 1000, pos, "o-", ms=3)
+            ax.axhline(final, color="g", ls="--", lw=0.8)
+            ax.set_xlabel("time since step (ms)")
+            ax.set_ylabel(f"spot {a.axis} (px)")
+            ax.grid(ls=":")
+            fig.savefig(f"{stem}.png", dpi=110)
+            print(f"saved {stem}.png")
+    finally:
+        mirror.close()
+        cam.close()
+
+
+def target(a, cal):
+    """Target pixel from the command line, or the middle of the reachable area."""
+    r = cal["reach"]
+    x = a.x if a.x is not None else sum(r["x"]) / 2
+    y = a.y if a.y is not None else sum(r["y"]) / 2
+    if not (r["x"][0] <= x <= r["x"][1] and r["y"][0] <= y <= r["y"][1]):
+        print(f"warning: ({x:.0f}, {y:.0f}) is outside the calibrated area")
+    return x, y
+
+
 def cmd_preview(a):
     dev = find_device()
     x = xu.XU(dev)
@@ -405,6 +514,46 @@ def main():
 
     p = sub.add_parser("focus", help="live sharpness meter for focusing a lens")
     common(p, exposure=10000)
+
+    p = sub.add_parser("fsm", help="steer the spot with the fast steering mirror")
+    fs = p.add_subparsers(dest="action", required=True)
+
+    def fsm_common(p, settle):
+        p.add_argument("--port", default="/dev/ttyUSB0", help="mirror controller serial port")
+        p.add_argument("-e", "--exposure", type=float, default=500, help="us")
+        p.add_argument("-g", "--gain", type=float, default=0.0, help="dB, 0..48")
+        p.add_argument("--settle", type=float, default=settle,
+                       help="s to wait after each mirror move")
+
+    def xy(p):
+        p.add_argument("x", type=float, nargs="?", help="target px (default: middle of reach)")
+        p.add_argument("y", type=float, nargs="?")
+
+    q = fs.add_parser("move", help="set voltages directly and report where the spot is")
+    fsm_common(q, 0.1)
+    q.add_argument("vx", type=float)
+    q.add_argument("vy", type=float)
+
+    q = fs.add_parser("calibrate", help="voltage grid scan + model fit")
+    fsm_common(q, 0.05)
+    q.add_argument("--grid", type=int, default=7, help="points per axis")
+
+    q = fs.add_parser("goto", help="put the spot on a pixel")
+    fsm_common(q, 0.02)
+    xy(q)
+    q.add_argument("--tol", type=float, default=0.2, help="px")
+
+    q = fs.add_parser("track", help="hold the spot on a pixel (PI loop)")
+    fsm_common(q, 0.0)
+    xy(q)
+    q.add_argument("-t", "--duration", type=float, default=10, help="seconds")
+    q.add_argument("--kp", type=float, default=0.5)
+    q.add_argument("--ki", type=float, default=0.02)
+
+    q = fs.add_parser("settle", help="step response: how fast the mirror settles")
+    fsm_common(q, 0.0)
+    q.add_argument("--step", type=float, default=5.0, help="V")
+    q.add_argument("--axis", choices=["x", "y"], default="x")
 
     p = sub.add_parser("preview", help="live view window (gstreamer)")
     p.add_argument("-e", "--exposure", type=float, default=10000, help="us")
